@@ -3,12 +3,6 @@ import Foundation
 import Speech
 import UIKit
 
-/// Records from the microphone and transcribes speech live, entirely on-device,
-/// using `SpeechAnalyzer` with a `SpeechTranscriber` module.
-///
-/// Recording keeps running while the app is in the background (the target has the
-/// "audio" background mode) and automatically resumes after system interruptions
-/// such as phone calls or Siri. It only ends when `stop()` is called.
 @Observable
 final class LiveTranscriber {
     enum State: Equatable {
@@ -33,15 +27,13 @@ final class LiveTranscriber {
     }
 
     private(set) var state: State = .idle
-    /// True while the system has paused the microphone, for example during a phone call.
     private(set) var isInterrupted = false
-    /// Text the transcriber has committed to; it won't change.
-    private(set) var finalizedText = ""
-    /// Tentative text for the most recent audio; it's replaced as the transcriber refines it.
+    private(set) var segments: [TranscriptSegment] = []
     private(set) var volatileText = ""
     private(set) var startDate: Date?
     var errorMessage: String?
 
+    var finalizedText: String { segments.map(\.text).joined(separator: " ") }
     var fullText: String { Self.join(finalizedText, volatileText) }
 
     var elapsed: TimeInterval {
@@ -56,13 +48,20 @@ final class LiveTranscriber {
     private var resultsTask: Task<Void, Never>?
     private var observerTasks: [Task<Void, Never>] = []
 
+    private let voiceFeatures = VoiceFeatureStore()
+    private var featureProcessor: VoiceFeatureProcessor?
+    private var clusterer = SpeakerClusterer()
+
     func start() async {
         guard state == .idle else { return }
         state = .preparing
         errorMessage = nil
         isInterrupted = false
-        finalizedText = ""
+        segments = []
         volatileText = ""
+        voiceFeatures.removeAll()
+        featureProcessor = VoiceFeatureProcessor(store: voiceFeatures)
+        clusterer = SpeakerClusterer()
 
         do {
             guard await AVAudioApplication.requestRecordPermission() else { throw TranscriberError.microphoneDenied }
@@ -72,7 +71,6 @@ final class LiveTranscriber {
 
             let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
 
-            // Download the on-device speech model for this language if needed.
             if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
                 try await request.downloadAndInstall()
             }
@@ -90,7 +88,7 @@ final class LiveTranscriber {
                     for try await result in transcriber.results {
                         let text = String(result.text.characters)
                         if result.isFinal {
-                            finalizedText = Self.join(finalizedText, text)
+                            appendFinalized(text, start: result.range.start.seconds, end: result.range.end.seconds)
                             volatileText = ""
                         } else {
                             volatileText = text
@@ -113,13 +111,12 @@ final class LiveTranscriber {
                 }
             }
 
-            try activateAudioSession()
+            try await activateAudioSession()
             try startEngine()
             observeSystemEvents()
 
             startDate = .now
             state = .recording
-            // Keep the screen awake while the app is in front.
             UIApplication.shared.isIdleTimerDisabled = true
         } catch {
             errorMessage = error.localizedDescription
@@ -127,14 +124,12 @@ final class LiveTranscriber {
         }
     }
 
-    /// Stops recording, waits for the final transcription, and returns the full transcript.
     @discardableResult
-    func stop() async -> String {
-        guard state == .recording else { return fullText }
+    func stop() async -> [TranscriptSegment] {
+        guard state == .recording else { return segments }
         state = .finishing
 
         stopEngine()
-        // Push any audio the converter is still holding, then end the input.
         if let converter, let remaining = try? converter.flush() {
             for input in remaining {
                 inputContinuation?.yield(input)
@@ -142,29 +137,50 @@ final class LiveTranscriber {
         }
         inputContinuation?.finish()
 
-        // Let the analyzer finalize the remaining audio and deliver the last results.
         await analysisTask?.value
         await resultsTask?.value
 
-        finalizedText = fullText
-        volatileText = ""
+        if !volatileText.isEmpty {
+            appendFinalized(volatileText, start: segments.last?.end ?? 0, end: elapsed)
+            volatileText = ""
+        }
+        segments = SpeakerClusterer.refine(segments)
         await tearDown()
-        return finalizedText
+        return segments
     }
 
-    // MARK: - Audio
+    private func appendFinalized(_ text: String, start: TimeInterval, end: TimeInterval) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
 
-    private func activateAudioSession() throws {
+        let validRange = start.isFinite && end.isFinite && end > start
+        let frames = validRange ? voiceFeatures.takeFrames(from: start, to: end) : []
+        let voiceprint = Voiceprint.make(from: frames)
+        let speaker = clusterer.assign(voiceprint)
+        segments.append(TranscriptSegment(
+            speaker: speaker,
+            text: trimmed,
+            start: validRange ? start : (segments.last?.end ?? 0),
+            end: validRange ? end : (segments.last?.end ?? 0),
+            voiceprint: voiceprint
+        ))
+    }
+
+    private func activateAudioSession() async throws {
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.record, mode: .default)
-        try session.setActive(true)
+        try await session.activate(options: [])
     }
 
-    /// Creates a fresh engine each time so it picks up the current input route and format.
     private func startEngine() throws {
-        guard let converter, let inputContinuation else { return }
+        guard let converter, let inputContinuation, let featureProcessor else { return }
         let engine = AVAudioEngine()
-        try Self.installTap(on: engine.inputNode, converter: converter, continuation: inputContinuation)
+        try Self.installTap(
+            on: engine.inputNode,
+            converter: converter,
+            featureProcessor: featureProcessor,
+            continuation: inputContinuation
+        )
         engine.prepare()
         try engine.start()
         self.engine = engine
@@ -176,43 +192,41 @@ final class LiveTranscriber {
         engine = nil
     }
 
-    /// Restarts the microphone after an interruption or a route change, if we're still recording.
-    private func restartEngine() {
+    private func restartEngine() async {
         guard state == .recording else { return }
         stopEngine()
         do {
-            try activateAudioSession()
+            try await activateAudioSession()
+            guard state == .recording else { return }
             try startEngine()
             isInterrupted = false
         } catch {
-            // Usually means another app still holds the mic; we retry when the app becomes active.
             isInterrupted = true
         }
     }
 
-    /// The tap runs on a real-time audio thread, so it's built outside the main actor.
     private nonisolated static func installTap(
         on node: AVAudioInputNode,
         converter: AnalyzerInputConverter,
+        featureProcessor: VoiceFeatureProcessor,
         continuation: AsyncStream<AnalyzerInput>.Continuation
     ) throws {
         let format = node.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw TranscriberError.noMicrophoneInput }
 
         nonisolated(unsafe) let converter = converter
-        // `installAudioTap` requires a buffer size between 100 and 400 ms of audio.
+        nonisolated(unsafe) let featureProcessor = featureProcessor
         let bufferSize = AVAudioFrameCount(format.sampleRate * 0.1)
         try node.installAudioTap(onBus: 0, bufferSize: bufferSize, format: format) { buffer, _ in
-            // `AnalyzerInputConverter` only accepts `AVAudioBuffer`, so copy the read-only samples into one.
-            guard let pcmBuffer = makePCMBuffer(copying: buffer),
-                  let inputs = try? converter.convert(pcmBuffer, at: nil) else { return }
+            guard let pcmBuffer = makePCMBuffer(copying: buffer) else { return }
+            featureProcessor.process(pcmBuffer)
+            guard let inputs = try? converter.convert(pcmBuffer, at: nil) else { return }
             for input in inputs {
                 continuation.yield(input)
             }
         }
     }
 
-    /// Copies a read-only tap buffer into a new `AVAudioPCMBuffer` the converter can retain.
     private nonisolated static func makePCMBuffer(copying source: AVReadOnlyAudioPCMBuffer) -> AVAudioPCMBuffer? {
         let frameLength = AVAudioFrameCount(source.frameLength)
         guard let destination = AVAudioPCMBuffer(pcmFormat: source.format, frameCapacity: frameLength) else { return nil }
@@ -229,12 +243,9 @@ final class LiveTranscriber {
         return destination
     }
 
-    // MARK: - System events
-
     private func observeSystemEvents() {
         let center = NotificationCenter.default
 
-        // Phone calls, Siri, alarms, and other apps can take the microphone temporarily.
         observerTasks.append(Task { [weak self] in
             for await _ in center.notifications(named: AVAudioSession.didBecomeInactiveNotification) {
                 guard self?.state == .recording else { continue }
@@ -243,32 +254,27 @@ final class LiveTranscriber {
             }
         })
 
-        // Resume as soon as the system allows it, whatever it recommends: only Stop should end a recording.
         observerTasks.append(Task { [weak self] in
             for await _ in center.notifications(named: AVAudioSession.resumptionRecommendationNotification) {
                 guard self?.isInterrupted == true else { continue }
-                self?.restartEngine()
+                await self?.restartEngine()
             }
         })
 
-        // Plugging in headphones or connecting a Bluetooth mic changes the input format.
         observerTasks.append(Task { [weak self] in
             for await _ in center.notifications(named: .AVAudioEngineConfigurationChange) {
                 guard self?.isInterrupted == false else { continue }
-                self?.restartEngine()
+                await self?.restartEngine()
             }
         })
 
-        // If the mic couldn't be recovered earlier, try again when the person returns to the app.
         observerTasks.append(Task { [weak self] in
             for await _ in center.notifications(named: UIApplication.didBecomeActiveNotification) {
                 guard self?.isInterrupted == true else { continue }
-                self?.restartEngine()
+                await self?.restartEngine()
             }
         })
     }
-
-    // MARK: - Cleanup
 
     private func tearDown() async {
         stopEngine()
@@ -282,8 +288,10 @@ final class LiveTranscriber {
         resultsTask = nil
         analyzer = nil
         converter = nil
+        featureProcessor = nil
+        voiceFeatures.removeAll()
         isInterrupted = false
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        _ = try? await AVAudioSession.sharedInstance().deactivate(options: .notifyOthersOnDeactivation)
         UIApplication.shared.isIdleTimerDisabled = false
         state = .idle
     }

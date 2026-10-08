@@ -270,7 +270,8 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = MyApp/Info.plist;
+				INFOPLIST_FILE = "Transcribe&Learn/Info.plist";
+				INFOPLIST_KEY_NSCameraUsageDescription = "The camera is used to photograph slides and whiteboards so they can enrich your lecture notes.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "The microphone is used to record and transcribe your lectures on-device.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Speech recognition turns your lecture recordings into text, entirely on this device.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
@@ -312,7 +313,8 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = MyApp/Info.plist;
+				INFOPLIST_FILE = "Transcribe&Learn/Info.plist";
+				INFOPLIST_KEY_NSCameraUsageDescription = "The camera is used to photograph slides and whiteboards so they can enrich your lecture notes.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "The microphone is used to record and transcribe your lectures on-device.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Speech recognition turns your lecture recordings into text, entirely on this device.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;

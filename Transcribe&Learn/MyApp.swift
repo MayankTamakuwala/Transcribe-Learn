@@ -6,6 +6,6 @@ import SwiftUI
         WindowGroup {
             ContentView()
         }
-        .modelContainer(for: Lecture.self)
+        .modelContainer(for: [Lecture.self, LecturePhoto.self])
     }
 }

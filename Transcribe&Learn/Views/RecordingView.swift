@@ -1,13 +1,22 @@
 import SwiftUI
 
-/// Full-screen recording session that shows the transcript as it's spoken.
-/// Recording begins only when the person taps Start and ends only when they tap Stop.
+struct RecordingResult {
+    struct Photo {
+        var data: Data
+        var takenAt: Date
+    }
+
+    var segments: [TranscriptSegment]
+    var duration: TimeInterval
+    var photos: [Photo]
+}
+
 struct RecordingView: View {
-    /// Called with the finished transcript and recording duration when the person taps Stop.
-    let onFinish: (String, TimeInterval) -> Void
+    let onFinish: (RecordingResult) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var transcriber = LiveTranscriber()
+    @State private var photos: [RecordingResult.Photo] = []
     @State private var isConfirmingDiscard = false
 
     var body: some View {
@@ -16,6 +25,10 @@ struct RecordingView: View {
                 header
                 Divider()
                 transcriptView
+                if !photos.isEmpty {
+                    Divider()
+                    photoStrip
+                }
             }
             .navigationTitle("New Lecture")
             .navigationBarTitleDisplayMode(.inline)
@@ -30,6 +43,12 @@ struct RecordingView: View {
                             .disabled(transcriber.state != .idle)
                     }
                 }
+                ToolbarItemGroup(placement: .primaryAction) {
+                    AddPhotoButtons { data in
+                        photos.append(RecordingResult.Photo(data: data, takenAt: .now))
+                    }
+                    .disabled(transcriber.state == .finishing)
+                }
             }
             .confirmationDialog(
                 "Discard this recording?",
@@ -43,7 +62,7 @@ struct RecordingView: View {
                     }
                 }
             } message: {
-                Text("The transcript so far will be lost.")
+                Text("The transcript and photos so far will be lost.")
             }
             .safeAreaInset(edge: .bottom) {
                 controlButton
@@ -82,9 +101,7 @@ struct RecordingView: View {
                     Text(placeholderText)
                         .foregroundStyle(.secondary)
                 } else {
-                    // Finalized text in the primary color, tentative text dimmed.
-                    let volatile = transcriber.volatileText.isEmpty ? "" : " " + transcriber.volatileText
-                    Text("\(transcriber.finalizedText)\(Text(volatile).foregroundStyle(.secondary))")
+                    LiveTranscriptView(segments: transcriber.segments, volatileText: transcriber.volatileText)
                 }
             }
             .font(.title3)
@@ -93,6 +110,31 @@ struct RecordingView: View {
             .padding()
         }
         .defaultScrollAnchor(.bottom)
+    }
+
+    private var photoStrip: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 10) {
+                ForEach(Array(photos.enumerated()), id: \.offset) { index, photo in
+                    if let image = UIImage(data: photo.data) {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 96, height: 72)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .contextMenu {
+                                Button("Remove Photo", systemImage: "trash", role: .destructive) {
+                                    photos.remove(at: index)
+                                }
+                            }
+                            .accessibilityLabel("Photo \(index + 1)")
+                    }
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 10)
+        }
+        .scrollIndicators(.hidden)
     }
 
     @ViewBuilder
@@ -115,9 +157,9 @@ struct RecordingView: View {
                 Button {
                     Task {
                         let duration = transcriber.elapsed
-                        let transcript = await transcriber.stop()
-                        if !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            onFinish(transcript, duration)
+                        let segments = await transcriber.stop()
+                        if !segments.isEmpty || !photos.isEmpty {
+                            onFinish(RecordingResult(segments: segments, duration: duration, photos: photos))
                         }
                         dismiss()
                     }
@@ -153,7 +195,7 @@ struct RecordingView: View {
 
     private var placeholderText: String {
         switch transcriber.state {
-        case .idle: "Tap Start Recording when the lecture begins. Recording continues if you switch apps or lock your iPad, and only stops when you tap Stop."
+        case .idle: "Tap Start Recording when the lecture begins. Recording continues if you switch apps or lock your iPad, and only stops when you tap Stop. Use the camera button to photograph slides or the whiteboard."
         case .preparing: "Getting ready…"
         default: "Listening…"
         }
